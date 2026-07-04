@@ -1,21 +1,64 @@
 /**
- * graph-memory
- *
- * By: adoresever
- * Email: Wywelljob@gmail.com
+ * graph-memory-pro — 类型定义
  */
 
-/**
- * graph-memory 类型定义
- *
- * 节点：TASK / SKILL / EVENT
- * 边：USED_SKILL / SOLVED_BY / REQUIRES / PATCHES / CONFLICTS_WITH
- */
+export interface Neo4jConfig {
+  uri: string;
+  user: string;
+  password: string;
+}
 
-// ─── 节点 ─────────────────────────────────────────────────────
+export interface LlmConfig {
+  apiKey?: string;
+  baseURL?: string;
+  model?: string;
+}
+
+export interface EmbeddingConfig {
+  apiKey?: string;
+  baseURL?: string;
+  model?: string;
+  dimensions?: number;
+  options?: Record<string, number | boolean | string>;
+  keepAlive?: string;
+}
+
+/** Timing / latency distribution options */
+export interface GmTimingOptions {
+  /** Enable per-phase timing collection */
+  enabled: boolean;
+  /** Number of samples to keep per phase before rolling (default 1000) */
+  maxSamples?: number;
+  /** Print distribution report every N calls (0 = disabled, default 50) */
+  reportEveryN?: number;
+}
+
+export interface GmConfig {
+  neo4j: Neo4jConfig;
+  compactTurnCount: number;
+  recallMaxNodes: number;
+  recallMaxDepth: number;
+  freshTailCount: number;
+  dedupThreshold: number;
+  pagerankDamping: number;
+  pagerankIterations: number;
+  llm?: LlmConfig;
+  embedding?: EmbeddingConfig;
+  /** Latency distribution tracking (optional) */
+  timing?: GmTimingOptions;
+}
 
 export type NodeType = "TASK" | "SKILL" | "EVENT";
-export type NodeStatus = "active" | "deprecated";
+
+export type EdgeType =
+  | "USED_SKILL"
+  | "SOLVED_BY"
+  | "REQUIRES"
+  | "PATCHES"
+  | "CONFLICTS_WITH"
+  | "RELATES_TO"
+
+export type NodeStatus = "active" | "deprecated" | "merged";
 
 export interface GmNode {
   id: string;
@@ -24,85 +67,40 @@ export interface GmNode {
   description: string;
   content: string;
   status: NodeStatus;
-  validatedCount: number;
-  sourceSessions: string[];
-  communityId: string | null;
+  communityId?: string;
   pagerank: number;
+  validatedCount: number;
+  createdAt: number;
+  updatedAt: number;
+  embedding?: number[];
+}
+
+export interface GmEdge {
+  id: string;
+  type: EdgeType;
+  fromId: string;
+  toId: string;
+  instruction: string;
+  condition?: string;
+  weight: number;
   createdAt: number;
   updatedAt: number;
 }
 
-// ─── 边 ───────────────────────────────────────────────────────
+export interface GmSessionMetadata {
+  sessionKey: string;
+  assistantId?: string;
+  assistantName?: string;
+}
 
-export type EdgeType =
-  | "USED_SKILL"
-  | "SOLVED_BY"
-  | "REQUIRES"
-  | "PATCHES"
-  | "CONFLICTS_WITH";
-
-export interface GmEdge {
+export interface GmMessage {
   id: string;
-  fromId: string;
-  toId: string;
-  type: EdgeType;
-  instruction: string;
-  condition?: string;
-  sessionId: string;
+  sessionKey: string;
+  turnIndex: number;
+  role: "user" | "assistant";
+  content: string;
   createdAt: number;
 }
-
-// ─── 信号 ─────────────────────────────────────────────────────
-
-export type SignalType =
-  | "tool_error"
-  | "tool_success"
-  | "skill_invoked"
-  | "user_correction"
-  | "explicit_record"
-  | "task_completed";
-
-export interface Signal {
-  type: SignalType;
-  turnIndex: number;
-  data: Record<string, any>;
-}
-
-// ─── 提取结果 ─────────────────────────────────────────────────
-
-export interface ExtractionResult {
-  nodes: Array<{
-    type: NodeType;
-    name: string;
-    description: string;
-    content: string;
-  }>;
-  edges: Array<{
-    from: string;
-    to: string;
-    type: EdgeType;
-    instruction: string;
-    condition?: string;
-  }>;
-}
-
-export interface FinalizeResult {
-  promotedSkills: Array<{
-    type: "SKILL";
-    name: string;
-    description: string;
-    content: string;
-  }>;
-  newEdges: Array<{
-    from: string;
-    to: string;
-    type: EdgeType;
-    instruction: string;
-  }>;
-  invalidations: string[];
-}
-
-// ─── 召回结果 ─────────────────────────────────────────────────
 
 export interface RecallResult {
   nodes: GmNode[];
@@ -110,44 +108,59 @@ export interface RecallResult {
   tokenEstimate: number;
 }
 
-// ─── Embedding 配置 ──────────────────────────────────────────
+export interface ExtractResult {
+  nodes: ExtractNode[];
+  edges: ExtractEdge[];
+}
 
-export interface EmbeddingConfig {
-  apiKey?: string;
+export interface ExtractNode {
+  type: NodeType;
+  name: string;
+  description: string;
+  content: string;
+}
+
+export interface ExtractEdge {
+  type: EdgeType;
+  fromName: string;
+  toName: string;
+  instruction: string;
+  condition?: string;
+}
+
+export interface CommunitySummary {
+  communityId: string;
+  summary: string;
+  memberCount: number;
+  embedding?: number[];
+}
+
+
+/**
+ * Predefined Embedding Model Presets
+ */
+export interface EmbeddingModelPreset {
+  model: string;
+  dimensions: number;
   baseURL?: string;
-  model?: string;
-  dimensions?: number;
+  description: string;
 }
 
-// ─── 插件配置 ─────────────────────────────────────────────────
-
-export interface GmConfig {
-  dbPath: string;
-  compactTurnCount: number;
-  recallMaxNodes: number;
-  recallMaxDepth: number;
-  freshTailCount: number;
-  embedding?: EmbeddingConfig;
-  llm?: {
-    apiKey?: string;
-    baseURL?: string;
-    model?: string;
-  };
-  /** 向量去重阈值，余弦相似度超过此值视为重复 (0-1) */
-  dedupThreshold: number;
-  /** PageRank 阻尼系数 */
-  pagerankDamping: number;
-  /** PageRank 迭代次数 */
-  pagerankIterations: number;
-}
-
-export const DEFAULT_CONFIG: GmConfig = {
-  dbPath: "~/.openclaw/graph-memory.db",
-  compactTurnCount: 6,
-  recallMaxNodes: 6,
-  recallMaxDepth: 2,
-  freshTailCount: 10,
-  dedupThreshold: 0.90,
-  pagerankDamping: 0.85,
-  pagerankIterations: 20,
+export const EMBEDDING_PRESETS: Record<string, EmbeddingModelPreset> = {
+  "text-embedding-3-small": {
+    model: "text-embedding-3-small",
+    dimensions: 1024,
+    description: "OpenAI text-embedding-3-small",
+  },
+  "nomic-embed-text": {
+    model: "nomic-embed-text",
+    dimensions: 768,
+    description: "Nomic Embed Text (Ollama)",
+  },
+  "qwen3.5-embedding-0.6b": {
+    model: "Qwen3.5-Embedding-0.6B-GGUF",
+    dimensions: 1024,
+    baseURL: "http://localhost:11434/v1",
+    description: "Qwen3.5 Embedding 0.6B GGUF (Ollama, local)",
+  },
 };
