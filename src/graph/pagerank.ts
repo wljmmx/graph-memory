@@ -1,244 +1,254 @@
 /**
- * graph-memory — Personalized PageRank (PPR)
+ * graph-memory-pro — PageRank (Neo4j GDS 2.12 OpenGDS)
  *
- * By: adoresever
- * Email: Wywelljob@gmail.com
- *
- * ═══════════════════════════════════════════════════════════════
- * 个性化 PageRank（Personalized PageRank）
- *
- * 区别于全局 PageRank：
- *   全局 PR：所有节点均匀起步，算一个固定的全局排名
- *   个性化 PPR：从用户查询命中的种子节点出发，沿边传播权重
- *              离种子越近的节点分数越高
- *
- * 同一个图谱：
- *   问 "Docker 部署"   → Docker 相关 SKILL 分数最高
- *   问 "conda 环境"    → conda 相关 SKILL 分数最高
- *   问 "bilibili 爬虫" → bilibili 相关 TASK/SKILL 分数最高
- *
- * 计算时机：
- *   recall 时实时算（不存数据库），每次查询都是新鲜的
- *   O(iterations * edges)，几千节点 < 5ms
- *
- * 另外保留一个全局 PageRank 作为基线，用于：
- *   - topNodes 兜底（没有种子时）
- *   - session_end 时写入 gm_nodes.pagerank 列
- * ═══════════════════════════════════════════════════════════════
+ * ✅ PPR & Global PR share a single in-memory projection
  */
 
-import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
+import type { Driver, Session } from "neo4j-driver";
 import type { GmConfig } from "../types.ts";
-import { updatePageranks } from "../store/store.ts";
+import { getSession } from "../store/db.ts";
+import { logPhase, isTimingEnabled } from "../timing.ts";
 
-// ─── 图结构缓存（避免每次 recall 都查 SQL） ─────────────────
+const ALL_REL_TYPES = ["NEXT_SESSION", "CONTAINS", "MENTIONS", "USED_SKILL", "SOLVED_BY", "REQUIRES", "PATCHES", "CONFLICTS_WITH", "RELATES_TO"];
 
-interface GraphStructure {
-  nodeIds: Set<string>;
-  /** 无向邻接表 */
-  adj: Map<string, string[]>;
-  /** 节点数 */
-  N: number;
-  /** 缓存时间 */
-  cachedAt: number;
+// ✅ Shared projection config
+const SHARED_GRAPH_NAME = "gm-shared";
+let _cachedRelTypeHash: string | null = null;
+let _cachedTimestamp = 0;
+const PROJECTION_TTL_MS = 15 * 60 * 1000; // 15 min TTL
+
+async function getExistingRelTypes(session: Session): Promise<string[]> {
+  const result = await session.run(`
+    MATCH (:Task|Skill|Event)-[r]->(:Task|Skill|Event)
+    WHERE type(r) IN $types
+    RETURN DISTINCT type(r) AS t
+  `, { types: ALL_REL_TYPES });
+  return result.records.map(r => r.get("t"));
+
+}
+/**
+ * Compute a stable hash of the relation-type set (for change detection).
+ */
+function relTypeHash(types: string[]): string {
+  return types.sort().join(",");
 }
 
-let _cached: GraphStructure | null = null;
-const CACHE_TTL = 30_000; // 30 秒缓存
+function buildRelProjection(existingTypes: string[]): string {
+  if (existingTypes.length === 0) return "'*'";
+  const parts = existingTypes.map(t => `${t}: {orientation: 'UNDIRECTED'}`);
+  return `{${parts.join(", ")}}`;
+}
 
 /**
- * 读取图结构（带缓存）
- * compact 会新增节点/边，但 30 秒内的查询共享同一份图结构没问题
+ * Ensure the shared projection exists and is fresh.
+ * - Within TTL and GDS-side exists -> reuse
+ * - TTL expired or struct changed -> drop + recreate
  */
-function loadGraph(db: DatabaseSyncInstance): GraphStructure {
-  if (_cached && Date.now() - _cached.cachedAt < CACHE_TTL) return _cached;
+async function ensureSharedProjection(session: Session): Promise<boolean> {
+  const now = Date.now();
+  const tEnsure = Date.now();
 
-  const nodeRows = db.prepare(
-    "SELECT id FROM gm_nodes WHERE status='active'"
-  ).all() as any[];
-  const nodeIds = new Set(nodeRows.map((r: any) => r.id));
+  // Fast path: within TTL and hash unchanged, check GDS-side existence
+  if (_cachedRelTypeHash && (now - _cachedTimestamp) < PROJECTION_TTL_MS) {
+    // Verify relation types haven't changed by comparing hash
+    const currentTypes = await getExistingRelTypes(session);
+    const currentHash = relTypeHash(currentTypes);
 
-  const edgeRows = db.prepare("SELECT from_id, to_id FROM gm_edges").all() as any[];
-  const adj = new Map<string, string[]>();
+    if (currentHash === _cachedRelTypeHash) {
+      const checkResult = await session.run(`
+        CALL gds.graph.exists($name)
+        YIELD exists
+        RETURN exists
+      `, { name: SHARED_GRAPH_NAME });
 
-  for (const id of nodeIds) adj.set(id, []);
-
-  for (const e of edgeRows) {
-    if (!nodeIds.has(e.from_id) || !nodeIds.has(e.to_id)) continue;
-    adj.get(e.from_id)!.push(e.to_id);
-    adj.get(e.to_id)!.push(e.from_id);
+      if (checkResult.records[0]?.get("exists") === true) {
+        logPhase("ensure_projection", Date.now() - tEnsure, { cache: "hit" });
+        return true;
+      }
+    }
+    // hash changed or graph missing → fall through to recreate
   }
 
-  _cached = { nodeIds, adj, N: nodeIds.size, cachedAt: Date.now() };
-  return _cached;
+  // Check if relation types changed
+  const currentTypes = await getExistingRelTypes(session);
+  const currentHash = relTypeHash(currentTypes);
+
+  if (currentTypes.length === 0) {
+    logPhase("ensure_projection", Date.now() - tEnsure, { status: "no_types" });
+    return false;
+  }
+
+  // Drop old and recreate
+  try { await session.run(`CALL gds.graph.drop('${SHARED_GRAPH_NAME}')`); } catch {}
+
+  const relProjection = buildRelProjection(currentTypes);
+  await session.run(
+    `CALL gds.graph.project('${SHARED_GRAPH_NAME}', ['Task', 'Skill', 'Event'], ${relProjection})`
+  );
+  _cachedTimestamp = now;
+  _cachedRelTypeHash = currentHash;
+  logPhase("ensure_projection", Date.now() - tEnsure, { status: "rebuilt" });
+  return true;
 }
-
-/** 图结构变化时清除缓存（compact/finalize 后调用） */
-export function invalidateGraphCache(): void {
-  _cached = null;
-}
-
-// ─── 个性化 PageRank ─────────────────────────────────────────
-
 export interface PPRResult {
-  /** nodeId → 个性化分数 */
   scores: Map<string, number>;
 }
 
-/**
- * 个性化 PageRank
- *
- * 从 seedIds 出发传播权重：
- *   - teleport 概率 (1-damping) 总是回到种子节点（不是均匀回到所有节点）
- *   - 这样种子附近的节点天然获得更高分数
- *
- * @param seedIds  用户查询命中的种子节点（FTS5/向量搜索结果）
- * @param candidateIds  需要排序的候选节点（图遍历结果）
- * @returns 候选节点的个性化分数
- */
-export function personalizedPageRank(
-  db: DatabaseSyncInstance,
+export async function personalizedPageRank(
+  driver: Driver,
   seedIds: string[],
   candidateIds: string[],
   cfg: GmConfig,
-): PPRResult {
-  const graph = loadGraph(db);
-  const { nodeIds, adj, N } = graph;
-  const damping = cfg.pagerankDamping;
-  const iterations = cfg.pagerankIterations;
-
-  if (N === 0 || seedIds.length === 0) {
+): Promise<PPRResult> {
+  if (!seedIds.length || !candidateIds.length) {
     return { scores: new Map() };
   }
 
-  // 种子节点集合（过滤掉不存在的）
-  const validSeeds = seedIds.filter(id => nodeIds.has(id));
-  if (validSeeds.length === 0) return { scores: new Map() };
+  const session = getSession(driver);
+  try {
+    const existingTypes = await getExistingRelTypes(session);
+    if (existingTypes.length === 0) {
+      const scores = new Map<string, number>();
+      candidateIds.forEach((id, i) => scores.set(id, 1 / (i + 1)));
+      return { scores };
+    }
 
-  // teleport 向量：只指向种子节点，均匀分配
-  const teleportWeight = 1 / validSeeds.length;
-  const seedSet = new Set(validSeeds);
+    // Ensure shared projection exists
+    const hasProjection = await ensureSharedProjection(session);
+    if (!hasProjection) {
+      const scores = new Map<string, number>();
+      candidateIds.forEach((id, i) => scores.set(id, 1 / (i + 1)));
+      return { scores };
+    }
 
-  // 初始分数：集中在种子节点上
-  let rank = new Map<string, number>();
-  for (const id of nodeIds) {
-    rank.set(id, seedSet.has(id) ? teleportWeight : 0);
+    return runPPR(session, SHARED_GRAPH_NAME, seedIds, candidateIds, cfg);
+  } catch (gdsErr) {
+    // GDS error: invalidate cache and fallback
+    _cachedRelTypeHash = null;
+    _cachedTimestamp = 0;
+    try { await session.run(`CALL gds.graph.drop('${SHARED_GRAPH_NAME}')`); } catch {}
+    const scores = new Map<string, number>();
+    candidateIds.forEach((id, i) => scores.set(id, 1 / (i + 1)));
+    return { scores };
+  } finally {
+    await session.close();
   }
-
-  // 迭代
-  for (let i = 0; i < iterations; i++) {
-    const newRank = new Map<string, number>();
-
-    // teleport 分量：回到种子节点
-    for (const id of nodeIds) {
-      newRank.set(id, seedSet.has(id) ? (1 - damping) * teleportWeight : 0);
-    }
-
-    // 传播分量：从邻居获得权重
-    for (const [nodeId, neighbors] of adj) {
-      if (neighbors.length === 0) continue;
-      const contrib = (rank.get(nodeId) || 0) / neighbors.length;
-      if (contrib === 0) continue;
-      for (const nb of neighbors) {
-        newRank.set(nb, (newRank.get(nb) || 0) + damping * contrib);
-      }
-    }
-
-    // dangling nodes 的分数传播回种子节点（不是均匀分配到所有节点）
-    let danglingSum = 0;
-    for (const id of nodeIds) {
-      const neighbors = adj.get(id);
-      if (!neighbors || neighbors.length === 0) {
-        danglingSum += rank.get(id) || 0;
-      }
-    }
-    if (danglingSum > 0) {
-      const danglingContrib = damping * danglingSum * teleportWeight;
-      for (const sid of validSeeds) {
-        newRank.set(sid, (newRank.get(sid) || 0) + danglingContrib);
-      }
-    }
-
-    rank = newRank;
-  }
-
-  // 只返回候选节点的分数
-  const result = new Map<string, number>();
-  for (const id of candidateIds) {
-    result.set(id, rank.get(id) || 0);
-  }
-
-  return { scores: result };
 }
 
-// ─── 全局 PageRank（基线，session_end 时更新） ──────────────
+async function runPPR(
+  session: Session,
+  graphName: string,
+  seedIds: string[],
+  candidateIds: string[],
+  cfg: GmConfig,
+): Promise<PPRResult> {
+  const tPprFn = Date.now();
+
+  const tSeed = Date.now();
+  const seedResult = await session.run(`
+    MATCH (n:Task|Skill|Event) WHERE n.id IN $seedIds AND n.status = 'active'
+    RETURN id(n) AS neoId
+  `, { seedIds });
+  logPhase("ppr_seed_lookup", Date.now() - tSeed, { seeds: seedResult.records.length });
+  const sourceNodeIds = seedResult.records.map(r => r.get("neoId"));
+
+  if (sourceNodeIds.length === 0) {
+    return { scores: new Map() };
+  }
+
+  const tCompute = Date.now();
+  const pprResult = await session.run(`
+    CALL gds.pageRank.stream($graphName, {
+      dampingFactor: $damping,
+      maxIterations: toInteger($iterations),
+      sourceNodes: $sourceNodes
+    })
+    YIELD nodeId, score
+    WITH gds.util.asNode(nodeId) AS node, score
+    WHERE node.id IN $candidateIds AND node.status = 'active'
+    RETURN node.id AS id, score
+    ORDER BY score DESC
+  `, {
+    graphName,
+    damping: cfg.pagerankDamping,
+    iterations: cfg.pagerankIterations,
+    sourceNodes: sourceNodeIds,
+    candidateIds,
+  });
+
+  const scores = new Map<string, number>();
+  logPhase("ppr_compute", Date.now() - tCompute, { gds_scores: pprResult.records.length });
+  for (const r of pprResult.records) {
+    const rawScore = r.get("score");
+    scores.set(r.get("id"), typeof rawScore === "number" ? rawScore : (rawScore?.toNumber?.() ?? 0));
+  }
+
+  logPhase("ppr_total", Date.now() - tPprFn, { scores: scores.size });
+  return { scores };
+}
 
 export interface GlobalPageRankResult {
   scores: Map<string, number>;
   topK: Array<{ id: string; name: string; score: number }>;
 }
 
-/**
- * 全局 PageRank — 写入 gm_nodes.pagerank 作为基线
- *
- * 用途：
- *   - topNodes 兜底排序（没有查询种子时的 fallback）
- *   - gm_stats 展示全局重要节点
- *
- * 只在 session_end / gm_maintain 时调用
- */
-export function computeGlobalPageRank(db: DatabaseSyncInstance, cfg: GmConfig): GlobalPageRankResult {
-  const graph = loadGraph(db);
-  const { nodeIds, adj, N } = graph;
-  const damping = cfg.pagerankDamping;
-  const iterations = cfg.pagerankIterations;
+export async function computeGlobalPageRank(driver: Driver, cfg: GmConfig): Promise<GlobalPageRankResult> {
+  const session = getSession(driver);
 
-  if (N === 0) return { scores: new Map(), topK: [] };
+  try {
+    const countResult = await session.run("MATCH (n:Task|Skill|Event {status: 'active'}) RETURN count(n) AS c");
+    const nodeCount = countResult.records[0]?.get("c")?.toNumber?.() ?? 0;
+    if (nodeCount === 0) return { scores: new Map(), topK: [] };
 
-  const nameRows = db.prepare(
-    "SELECT id, name FROM gm_nodes WHERE status='active'"
-  ).all() as any[];
-  const nameMap = new Map<string, string>();
-  nameRows.forEach(r => nameMap.set(r.id, r.name));
-
-  // 全局：均匀 teleport
-  let rank = new Map<string, number>();
-  const init = 1 / N;
-  for (const id of nodeIds) rank.set(id, init);
-
-  for (let i = 0; i < iterations; i++) {
-    const newRank = new Map<string, number>();
-    const base = (1 - damping) / N;
-    for (const id of nodeIds) newRank.set(id, base);
-
-    for (const [nodeId, neighbors] of adj) {
-      if (neighbors.length === 0) continue;
-      const contrib = (rank.get(nodeId) || 0) / neighbors.length;
-      for (const nb of neighbors) {
-        newRank.set(nb, (newRank.get(nb) || base) + damping * contrib);
-      }
+    const existingTypes = await getExistingRelTypes(session);
+    if (existingTypes.length === 0) {
+      const uniformScore = 1 / nodeCount;
+      await session.run("MATCH (n:Task|Skill|Event {status: 'active'}) SET n.pagerank = $score", { score: uniformScore });
+      return readTopK(session);
     }
 
-    let danglingSum = 0;
-    for (const id of nodeIds) {
-      const neighbors = adj.get(id);
-      if (!neighbors || neighbors.length === 0) danglingSum += rank.get(id) || 0;
-    }
-    if (danglingSum > 0) {
-      const dc = damping * danglingSum / N;
-      for (const id of nodeIds) newRank.set(id, (newRank.get(id) || 0) + dc);
+    // Reuse shared projection instead of creating a new one each time
+    const hasProjection = await ensureSharedProjection(session);
+    if (!hasProjection) {
+      const uniformScore = 1 / nodeCount;
+      await session.run("MATCH (n:Task|Skill|Event {status: 'active'}) SET n.pagerank = $score", { score: uniformScore });
+      return readTopK(session);
     }
 
-    rank = newRank;
+    // Global PR write mode - reuse shared projection
+    await session.run(`
+      CALL gds.pageRank.write('${SHARED_GRAPH_NAME}', {
+        writeProperty: 'pagerank',
+        dampingFactor: $damping,
+        maxIterations: toInteger($iterations)
+      })
+    `, { damping: cfg.pagerankDamping, iterations: cfg.pagerankIterations });
+
+    return readTopK(session);
+  } catch (err) {
+    console.warn(`[graph-memory-pro] pagerank failed: ${err}`);
+    _cachedRelTypeHash = null;
+    _cachedTimestamp = 0;
+    try { await session.run(`CALL gds.graph.drop('${SHARED_GRAPH_NAME}')`); } catch {}
+    return { scores: new Map(), topK: [] };
+  } finally {
+    await session.close();
   }
+}
 
-  // 写入数据库
-  updatePageranks(db, rank);
+async function readTopK(session: Session): Promise<GlobalPageRankResult> {
+  const topResult = await session.run(`
+    MATCH (n:Task|Skill|Event {status: 'active'}) RETURN n.id AS id, n.name AS name, n.pagerank AS score
+    ORDER BY n.pagerank DESC LIMIT 20
+  `);
 
-  const sorted = Array.from(rank.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 20)
-    .map(([id, score]) => ({ id, name: nameMap.get(id) || id, score }));
-
-  return { scores: rank, topK: sorted };
+  const scores = new Map<string, number>();
+  const topK: Array<{ id: string; name: string; score: number }> = [];
+  for (const r of topResult.records) {
+    const raw = r.get("score");
+    const score = typeof raw === "number" ? raw : (raw?.toNumber?.() ?? 0);
+    scores.set(r.get("id"), score);
+    topK.push({ id: r.get("id"), name: r.get("name"), score });
+  }
+  return { scores, topK };
 }

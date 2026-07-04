@@ -1,191 +1,89 @@
 /**
- * graph-memory
- *
- * By: adoresever
- * Email: Wywelljob@gmail.com
+ * graph-memory-pro — Neo4j 连接管理（带自动重连）
  */
 
-import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
-import { mkdirSync } from "fs";
-import { homedir } from "os";
+import neo4j, { Driver, Session, auth } from "neo4j-driver";
+import type { Neo4jConfig } from "../types.ts";
 
-let _db: DatabaseSyncInstance | null = null;
+const RETRY_DELAYS = [1000, 3000, 5000];
 
-export function resolvePath(p: string): string {
-  return p.replace(/^~/, homedir());
+let _driver: Driver | null = null;
+let _config: Neo4jConfig | null = null;
+
+export function createDriver(cfg: Neo4jConfig): Driver {
+  const d = neo4j.driver(cfg.uri, auth.basic(cfg.user, cfg.password), {
+    maxConnectionLifetime: 3 * 60 * 60 * 1000, // 3h
+    maxConnectionPoolSize: 50,
+    connectionAcquisitionTimeout: 10_000,
+    // logging removed to avoid Neo4j ESM bundling issue
+  });
+  return d;
 }
 
-export function getDb(dbPath: string): DatabaseSyncInstance {
-  if (_db) return _db;
-  const resolved = resolvePath(dbPath);
-  
-  // 修复：同时处理 Windows 和 Unix 路径分隔符
-  const lastSeparator = Math.max(
-    resolved.lastIndexOf("/"),
-    resolved.lastIndexOf("\\")
-  );
-  
-  if (lastSeparator > 0) {
-    const dirPath = resolved.substring(0, lastSeparator);
-    mkdirSync(dirPath, { recursive: true });
-  } else if (lastSeparator === 0) {
-    // 路径像是 "/file.db" 或 "C:file.db"
-    // 在根目录或驱动器根目录，不需要创建目录
-  } else {
-    // lastSeparator === -1，路径没有分隔符
-    // 像是 "file.db"，使用当前目录，不需要创建目录
-  }
-
-  _db = new DatabaseSync(resolved);
-  _db.exec("PRAGMA journal_mode = WAL");
-  _db.exec("PRAGMA foreign_keys = ON");
-  migrate(_db);
-  return _db;
+export function setDriver(d: Driver): void {
+  _driver = d;
 }
 
-/** 仅用于测试：关闭并重置单例 */
-export function closeDb(): void {
-  if (_db) { _db.close(); _db = null; }
+export function getDriver(): Driver | null {
+  return _driver;
 }
 
-function migrate(db: DatabaseSyncInstance): void {
-  db.exec(`CREATE TABLE IF NOT EXISTS _migrations (v INTEGER PRIMARY KEY, at INTEGER NOT NULL)`);
-  const cur = (db.prepare("SELECT MAX(v) as v FROM _migrations").get() as any)?.v ?? 0;
-  const steps = [m1_core, m2_messages, m3_signals, m4_fts5, m5_vectors, m6_communities];
-  for (let i = cur; i < steps.length; i++) {
-    steps[i](db);
-    db.prepare("INSERT INTO _migrations (v,at) VALUES (?,?)").run(i + 1, Date.now());
+export function initDriver(cfg: Neo4jConfig): Driver {
+  closeDriver();
+  _config = cfg;
+  _driver = createDriver(cfg);
+  return _driver;
+}
+
+export function closeDriver(): void {
+  if (_driver) {
+    const oldDriver = _driver;
+    _driver = null;
+    _config = null;
+    // 异步关闭旧 driver，不阻塞当前调用
+    oldDriver.close().catch(() => {
+      // ignore close errors
+    });
   }
 }
 
-// ─── 核心表：节点 + 边 ──────────────────────────────────────
-
-function m1_core(db: DatabaseSyncInstance): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS gm_nodes (
-      id              TEXT PRIMARY KEY,
-      type            TEXT NOT NULL CHECK(type IN ('TASK','SKILL','EVENT')),
-      name            TEXT NOT NULL,
-      description     TEXT NOT NULL DEFAULT '',
-      content         TEXT NOT NULL,
-      status          TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','deprecated')),
-      validated_count INTEGER NOT NULL DEFAULT 1,
-      source_sessions TEXT NOT NULL DEFAULT '[]',
-      community_id    TEXT,
-      pagerank        REAL NOT NULL DEFAULT 0,
-      created_at      INTEGER NOT NULL,
-      updated_at      INTEGER NOT NULL
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS ux_gm_nodes_name ON gm_nodes(name);
-    CREATE INDEX IF NOT EXISTS ix_gm_nodes_type_status ON gm_nodes(type, status);
-    CREATE INDEX IF NOT EXISTS ix_gm_nodes_community ON gm_nodes(community_id);
-
-    CREATE TABLE IF NOT EXISTS gm_edges (
-      id          TEXT PRIMARY KEY,
-      from_id     TEXT NOT NULL REFERENCES gm_nodes(id),
-      to_id       TEXT NOT NULL REFERENCES gm_nodes(id),
-      type        TEXT NOT NULL CHECK(type IN ('USED_SKILL','SOLVED_BY','REQUIRES','PATCHES','CONFLICTS_WITH')),
-      instruction TEXT NOT NULL,
-      condition   TEXT,
-      session_id  TEXT NOT NULL,
-      created_at  INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS ix_gm_edges_from ON gm_edges(from_id);
-    CREATE INDEX IF NOT EXISTS ix_gm_edges_to   ON gm_edges(to_id);
-  `);
+export function getConfig(): Neo4jConfig | null {
+  return _config;
 }
 
-// ─── 消息存储 ────────────────────────────────────────────────
-
-function m2_messages(db: DatabaseSyncInstance): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS gm_messages (
-      id          TEXT PRIMARY KEY,
-      session_id  TEXT NOT NULL,
-      turn_index  INTEGER NOT NULL,
-      role        TEXT NOT NULL,
-      content     TEXT NOT NULL,
-      extracted   INTEGER NOT NULL DEFAULT 0,
-      created_at  INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS ix_gm_msg_session ON gm_messages(session_id, turn_index);
-  `);
+/**
+ * 获取一个 Neo4j 会话
+ * 调用方负责 `await session.close()`
+ */
+export function getSession(driver: Driver): Session {
+  return driver.session({
+    defaultAccessMode: neo4j.session.WRITE,
+    database: "neo4j",
+  });
 }
 
-// ─── 信号存储 ────────────────────────────────────────────────
-
-function m3_signals(db: DatabaseSyncInstance): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS gm_signals (
-      id          TEXT PRIMARY KEY,
-      session_id  TEXT NOT NULL,
-      turn_index  INTEGER NOT NULL,
-      type        TEXT NOT NULL,
-      data        TEXT NOT NULL DEFAULT '{}',
-      processed   INTEGER NOT NULL DEFAULT 0,
-      created_at  INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS ix_gm_sig_session ON gm_signals(session_id, processed);
-  `);
-}
-
-// ─── FTS5 全文索引 ───────────────────────────────────────────
-
-function m4_fts5(db: DatabaseSyncInstance): void {
+/**
+ * 验证连接是否可用
+ */
+export async function verifyConnectivity(driver: Driver): Promise<boolean> {
   try {
-    db.exec(`
-      CREATE VIRTUAL TABLE IF NOT EXISTS gm_nodes_fts USING fts5(
-        name,
-        description,
-        content,
-        content=gm_nodes,
-        content_rowid=rowid
-      );
-    `);
-    db.exec(`
-      CREATE TRIGGER IF NOT EXISTS gm_nodes_ai AFTER INSERT ON gm_nodes BEGIN
-        INSERT INTO gm_nodes_fts(rowid, name, description, content)
-        VALUES (NEW.rowid, NEW.name, NEW.description, NEW.content);
-      END;
-      CREATE TRIGGER IF NOT EXISTS gm_nodes_ad AFTER DELETE ON gm_nodes BEGIN
-        INSERT INTO gm_nodes_fts(gm_nodes_fts, rowid, name, description, content)
-        VALUES ('delete', OLD.rowid, OLD.name, OLD.description, OLD.content);
-      END;
-      CREATE TRIGGER IF NOT EXISTS gm_nodes_au AFTER UPDATE ON gm_nodes BEGIN
-        INSERT INTO gm_nodes_fts(gm_nodes_fts, rowid, name, description, content)
-        VALUES ('delete', OLD.rowid, OLD.name, OLD.description, OLD.content);
-        INSERT INTO gm_nodes_fts(rowid, name, description, content)
-        VALUES (NEW.rowid, NEW.name, NEW.description, NEW.content);
-      END;
-    `);
+    await driver.verifyConnectivity();
+    return true;
   } catch {
-    // FTS5 不可用时静默降级到 LIKE 搜索
+    return false;
   }
 }
 
-// ─── 向量存储 ────────────────────────────────────────────────
-
-function m5_vectors(db: DatabaseSyncInstance): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS gm_vectors (
-      node_id      TEXT PRIMARY KEY REFERENCES gm_nodes(id),
-      content_hash TEXT NOT NULL,
-      embedding    BLOB NOT NULL
-    );
-  `);
-}
-
-// ─── 社区描述存储 ────────────────────────────────────────────
-
-function m6_communities(db: DatabaseSyncInstance): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS gm_communities (
-      id          TEXT PRIMARY KEY,
-      summary     TEXT NOT NULL,
-      node_count  INTEGER NOT NULL DEFAULT 0,
-      embedding   BLOB,
-      created_at  INTEGER NOT NULL,
-      updated_at  INTEGER NOT NULL
-    );
-  `);
+/**
+ * 带重试的连接验证
+ */
+export async function verifyWithRetry(driver: Driver): Promise<boolean> {
+  const delays = [...RETRY_DELAYS];
+  for (let attempt = 0; attempt <= delays.length; attempt++) {
+    if (await verifyConnectivity(driver)) return true;
+    if (attempt < delays.length) {
+      await new Promise((r) => setTimeout(r, delays[attempt]));
+    }
+  }
+  return false;
 }

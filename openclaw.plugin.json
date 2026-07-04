@@ -1,70 +1,71 @@
 {
-  "id": "graph-memory",
-  "name": "Graph Memory",
-  "version": "1.5.8",
-  "description": "知识图谱记忆引擎：从对话提取三元组，FTS5+图遍历+PageRank 跨对话召回，社区聚类+向量去重自动维护",
+  "id": "graph-memory-pro",
+  "name": "Graph Memory Pro",
+  "version": "2.1.0",
+  "description": "Neo4j 知识图谱记忆引擎：三元组提取 + GDS 图算法 + 向量索引 + 双路径召回",
+  "author": "Ananas <Wywelljob@gmail.com>",
+  "license": "MIT",
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": ["gm_search", "gm_record", "gm_stats", "gm_maintain"]
+  },
   "configSchema": {
     "type": "object",
+    "required": ["neo4j"],
     "properties": {
-      "dbPath": {
-        "type": "string",
-        "default": "~/.openclaw/graph-memory.db",
-        "description": "SQLite 图谱数据库路径"
-      },
-      "compactTurnCount": {
-        "type": "integer",
-        "default": 7,
-        "description": "每隔多少轮检查信号触发知识提取"
-      },
-      "recallMaxNodes": {
-        "type": "integer",
-        "default": 6,
-        "description": "跨对话召回最多注入几个节点"
-      },
-      "recallMaxDepth": {
-        "type": "integer",
-        "default": 2,
-        "description": "图遍历深度（从种子节点出发走几跳）"
-      },
-      "freshTailCount": {
-        "type": "integer",
-        "default": 10,
-        "description": "(deprecated) 已改为按用户轮次切分，此参数不再使用"
-      },
-      "dedupThreshold": {
-        "type": "number",
-        "default": 0.90,
-        "description": "向量去重阈值：余弦相似度超过此值视为重复节点 (0-1)"
-      },
-      "pagerankDamping": {
-        "type": "number",
-        "default": 0.85,
-        "description": "PageRank 阻尼系数"
-      },
-      "pagerankIterations": {
-        "type": "integer",
-        "default": 20,
-        "description": "PageRank 迭代次数"
-      },
-      "embedding": {
+      "neo4j": {
         "type": "object",
-        "description": "可选：向量搜索配置。配了用语义搜索+去重，没配用 FTS5 全文搜索",
+        "required": ["uri", "user", "password"],
         "properties": {
-          "apiKey": { "type": "string", "description": "Embedding API Key" },
-          "baseURL": { "type": "string", "default": "https://api.openai.com/v1", "description": "API 地址" },
-          "model": { "type": "string", "default": "text-embedding-3-small", "description": "模型名" },
-          "dimensions": { "type": "integer", "default": 512, "description": "向量维度" }
+          "uri": { "type": "string", "default": "bolt://localhost:37687", "description": "Neo4j bolt 连接地址" },
+          "user": { "type": "string", "default": "neo4j", "description": "Neo4j 用户名" },
+          "password": { "type": "string", "default": "", "description": "Neo4j 密码" }
         }
       },
+      "compactTurnCount": { "type": "number", "default": 6, "minimum": 1 },
+      "recallMaxNodes": { "type": "number", "default": 6, "minimum": 1, "maximum": 50 },
+      "recallMaxDepth": { "type": "number", "default": 2, "minimum": 1, "maximum": 5 },
+      "freshTailCount": { "type": "number", "default": 10, "minimum": 1 },
+      "dedupThreshold": { "type": "number", "default": 0.90, "minimum": 0, "maximum": 1 },
+      "pagerankDamping": { "type": "number", "default": 0.85, "minimum": 0, "maximum": 1 },
+      "pagerankIterations": { "type": "number", "default": 20, "minimum": 1 },
       "llm": {
         "type": "object",
-        "description": "可选：LLM 配置。不配则用 OpenClaw 全局 provider",
         "properties": {
           "apiKey": { "type": "string" },
           "baseURL": { "type": "string" },
           "model": { "type": "string" }
         }
+      },
+      "embedding": {
+        "type": "object",
+        "properties": {
+          "apiKey": { "type": "string" },
+          "baseURL": { "type": "string" },
+          "model": { "type": "string" },
+          "dimensions": { "type": "number", "default": 1024 }
+        }
       }
+    }
+  },
+  "uiHints": {
+    "neo4j": {
+      "label": "Neo4j 数据库连接",
+      "help": "配置 Neo4j 图数据库连接参数"
+    },
+    "neo4j.password": {
+      "label": "Neo4j 密码",
+      "sensitive": true
+    },
+    "llm.apiKey": {
+      "label": "LLM API Key",
+      "sensitive": true
+    },
+    "embedding.apiKey": {
+      "label": "Embedding API Key",
+      "sensitive": true
     }
   }
 }
